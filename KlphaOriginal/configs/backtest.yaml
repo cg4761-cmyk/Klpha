@@ -10,13 +10,15 @@ backtest:
   # 单只股票最小仓位阈值（低于此值视为0）
   lower_bound: 0.0
   
-  # 持仓天数（买入后持有多少天，然后平仓/调仓）
-  # 收益计算将使用此参数，确保评估的收益与实际持仓期一致
-  hold_period: 14  # 表示x个时间戳后平仓
+  # 滚动窗口大小（用于信号平滑，降低换手率）
+  # window_size > 1 时，使用过去 window_size 天的平均信号
+  # 例如 window_size=5 表示使用过去5天的平均信号，每天约调整 1/5 的仓位
+  window_size: 14  # window size(调仓平滑度)
   
   # 回测日期范围（可选，不指定则使用数据全部范围）
-  start_date: null
-  end_date: null
+  # 设置为最近3年：从2022-01-01开始（可根据需要调整）
+  start_date: "2022-01-01"  # 最近3年，null 表示使用全部数据
+  end_date: null  # null 表示到最新数据
   
   # 是否考虑交易成本
   include_costs: true

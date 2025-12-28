@@ -1,38 +1,47 @@
 """
 组合回测引擎
-参考加密货币回测代码，适配美股市场
+采用 Mark-to-Market (逐日盯市) 算法，适用于美股 Long-Only 策略
 """
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from numba import njit
 from pathlib import Path
 import yaml
+from research.backtest.signals import cs_booksize_nb
 
 
 @njit
-def diff_nb(data: np.ndarray, window: int) -> np.ndarray:
-    """计算差分（用于TVR计算）"""
-    result = np.zeros_like(data)
-    for i in range(window, data.shape[0]):
-        result[i] = data[i] - data[i - window]
-    return result
-
-
-def rolling_sum_nb(data: np.ndarray, window: int, minp: int = 1) -> np.ndarray:
+def _calculate_mddd(ret: np.ndarray) -> int:
     """
-    滚动求和（用于计算持仓）
-    使用纯 Python 实现，避免 Numba 类型推断问题
+    计算最大回撤持续时间（天数）
+    
+    Parameters:
+    -----------
+    ret : np.ndarray
+        单日收益率序列
+    
+    Returns:
+    --------
+    int
+        最大回撤持续时间（天数）
     """
-    result = np.zeros_like(data)
-    n_rows = data.shape[0]
+    returns = np.cumsum(ret) + 1
+    mddd = 0
+    max_value = 1.0
+    max_idx = 0
     
-    for i in range(n_rows):
-        start = max(0, i - window + 1)
-        # 使用 numpy 的 nansum，更高效
-        result[i] = np.nansum(data[start:i+1], axis=0)
+    for i in range(returns.shape[0]):
+        value = returns[i]
+        if value > max_value:
+            max_value = value
+            max_idx = i
+        else:
+            tmp_ddd = i - max_idx
+            if tmp_ddd > mddd:
+                mddd = tmp_ddd
     
-    return result
+    return mddd
 
 
 def simulate_portfolio(
@@ -42,183 +51,186 @@ def simulate_portfolio(
     costs: Dict,
     booksize: float = 1.0,
     upper_bound: float = 0.1,
-    forward_window: int = 1,
-    hold_period: int = 1
+    window_size: int = 1
 ) -> pd.DataFrame:
     """
-    模拟组合回测（参考 simulate2，适配美股）
+    Long-Only 组合回测引擎 (Mark-to-Market with Rolling Average)
+    
+    采用逐日盯市算法 + 滚动平均平滑信号：
+    - T 日收盘产生信号 -> T 日收盘/T+1 开盘买入 -> 享受 T+1 的涨跌幅
+    - 每日 PnL = 昨日持仓 * 今日收益率
+    - 使用滚动平均平滑信号，降低换手率（每天调整约 1/window_size 的仓位）
+    - 完全向量化实现，无 Python 循环
     
     Parameters:
     -----------
     alpha : pd.DataFrame
-        仓位信号，行=日期，列=股票代码，值=仓位权重
+        仓位信号，行=日期，列=股票代码，值=仓位权重（负值将被设为0）
     prices : pd.DataFrame
         价格数据（用于计算收益），行=日期，列=股票代码
     volume : pd.DataFrame
-        成交量数据（用于流动性计算），行=日期，列=股票代码
+        成交量数据（用于流动性计算），行=日期，列=股票代码（可选）
     costs : dict
         交易成本配置，包含 'total_cost' 等
     booksize : float
-        组合规模（归一化）
+        组合规模（归一化，默认1.0表示100%）
     upper_bound : float
-        单只股票最大仓位
-    forward_window : int
-        前瞻窗口（避免未来信息泄露，已弃用，实际使用 hold_period）
-    hold_period : int
-        持仓天数（买入后持有多少天，1表示每天调仓，5表示持仓5天）
-        收益计算将使用此参数，确保评估的收益与实际持仓期一致
+        单只股票最大仓位（按booksize的比例）
+    window_size : int
+        滚动窗口大小（>1时使用滚动平均平滑信号，降低换手率）
+        例如 window_size=5 表示使用过去5天的平均信号，每天约调整 1/5 的仓位
     
     Returns:
     --------
     pd.DataFrame
         回测结果，包含：
-        - ret: 每日收益
-        - ret_net: 扣除成本后的收益
-        - tvr: 换手率
-        - dailypnl: 每日盈亏
-        - long_size: 多仓规模
-        - short_size: 空仓规模
+        - ret: 每日收益率（费前）
+        - ret_net: 每日收益率（费后）
+        - tvr: 每日换手率
+        - dailypnl: 每日盈亏（绝对金额）
+        - dailypnl_net: 每日盈亏（扣除成本后）
+        - long_size: 每日多头总仓位
     """
-    # 确保索引对齐
-    common_dates = alpha.index.intersection(prices.index).intersection(volume.index)
-    alpha = alpha.loc[common_dates]
-    prices = prices.loc[common_dates]
-    volume = volume.loc[common_dates]
+    # ========== 1. 数据对齐 ==========
+    common_dates = alpha.index.intersection(prices.index)
+    common_symbols = alpha.columns.intersection(prices.columns)
     
-    # 计算未来收益（使用 hold_period，因为这是实际持有天数）
-    # 避免未来信息泄露：在 T 日只能看到 T 日及之前的数据
-    # 用未来 hold_period 天的收益来评估这次持仓
-    forward_returns = prices.pct_change(hold_period).shift(-hold_period)
+    if len(common_dates) == 0 or len(common_symbols) == 0:
+        raise ValueError("alpha 和 prices 没有共同的日期或股票代码")
     
-    # 对齐日期
-    common_dates = alpha.index.intersection(forward_returns.index)
-    alpha = alpha.loc[common_dates]
-    forward_returns = forward_returns.loc[common_dates]
-    volume = volume.loc[common_dates]
+    alpha = alpha.loc[common_dates, common_symbols]
+    prices = prices.loc[common_dates, common_symbols]
     
-    # 转换为 numpy 数组
-    alpha_values = alpha.values.copy()
-    returns = forward_returns.values
-    volume_values = volume.values
+    # ========== 2. 计算每日收益率（Mark-to-Market 核心）==========
+    # 使用 pct_change() 计算单日收益率，不预测未来
+    daily_returns = prices.pct_change().fillna(0.0)
     
-    # 处理缺失值
-    alpha_values = np.where(np.isnan(alpha_values), 0, alpha_values)
-    returns = np.where(np.isnan(returns), 0, returns)
+    # ========== 3. 输入清理：Long-Only 约束 ==========
+    # 填充 NaN 为 0
+    alpha_clean = alpha.fillna(0.0)
     
-    # 实现固定持仓期逻辑
-    # 如果 hold_period > 1，只在特定日期调仓，其他日期保持仓位不变
-    n_dates = len(common_dates)
-    actual_positions = np.zeros_like(alpha_values)
+    # 强制做多：将所有负值信号设为 0（在滚动之前处理）
+    alpha_clean = alpha_clean.clip(lower=0.0)
     
-    if hold_period > 1:
-        # 固定持仓期模式：每 hold_period 天调仓一次
-        for i in range(n_dates):
-            # 判断是否是调仓日（每 hold_period 天调一次）
-            if i % hold_period == 0:
-                # 调仓日：使用新的仓位信号
-                actual_positions[i] = alpha_values[i]
-            else:
-                # 非调仓日：保持上一次的仓位
-                if i > 0:
-                    actual_positions[i] = actual_positions[i-1]
-                else:
-                    actual_positions[i] = alpha_values[i]
+    # ========== 4. 滚动平均平滑信号（关键：降低换手率）==========
+    # 如果 window_size > 1，使用滚动平均来平滑信号
+    # 这模拟了"分批建仓"的效果：每天只调整约 1/window_size 的仓位
+    # 数学上，换手率会降低到约 1/window_size
+    if window_size > 1:
+        # 向量化滚动平均（完全无循环）
+        # 注意：必须在 DataFrame 上操作，不能是 numpy 数组
+        alpha_smoothed = alpha_clean.rolling(window=window_size, min_periods=1).mean()
     else:
-        # hold_period = 1：每天调仓（原有逻辑）
-        actual_positions = alpha_values
+        alpha_smoothed = alpha_clean
     
-    # 分离多空仓位（使用实际持仓）
-    long_alpha = actual_positions.copy()
-    short_alpha = actual_positions.copy()
-    long_alpha[long_alpha <= 0] = 0
-    short_alpha[short_alpha >= 0] = 0
+    # ========== 5. 横截面仓位标准化 ==========
+    # 关键：对平滑后的信号进行归一化，确保每天总仓位 = booksize
+    # 转换为 numpy 数组进行归一化
+    alpha_values = alpha_smoothed.values
     
-    # 计算多空规模
-    long_size = np.nansum(long_alpha, axis=1)
-    short_size = np.nansum(np.abs(short_alpha), axis=1)
+    # 调用 cs_booksize_nb 进行横截面归一化
+    actual_positions = cs_booksize_nb(
+        alpha_values,
+        size=booksize,
+        upper_bound=upper_bound,
+        lower_bound=0.0
+    )
     
-    # 计算 TVR（换手率）- 基于实际仓位变化
-    # 使用 hold_period 作为窗口，因为这是实际持仓期
-    window = hold_period
-    if hold_period > 1:
-        # 计算仓位变化（只在调仓日有变化）
-        position_diff = np.zeros_like(actual_positions)
-        for i in range(1, n_dates):
-            if i % hold_period == 0:
-                # 调仓日：计算仓位变化
-                position_diff[i] = actual_positions[i] - actual_positions[i-1]
-        alpha_diff = position_diff
-    else:
-        # 每天调仓：使用原有逻辑
-        alpha_diff = diff_nb(alpha_values, window)
+    # 转换回 DataFrame 以便后续向量化操作
+    pos_df = pd.DataFrame(
+        actual_positions,
+        index=common_dates,
+        columns=common_symbols
+    )
     
-    tvr = np.nansum(np.abs(alpha_diff), axis=1) / (booksize * window)
+    # ========== 6. 计算每日盈亏 (Mark-to-Market PnL) ==========
+    # 核心逻辑：今天的 PnL = 昨天的持仓 * 今天的收益率
+    # 将持仓向后移动一天：T 日的持仓享受 T+1 日的收益
+    pos_shifted = pos_df.shift(1).fillna(0.0)  # 第一天为0（建仓前）
     
-    # 计算流动性指标（基于成交量）
-    dollar_volume = prices.loc[common_dates].values * volume_values
-    liq = np.abs(alpha_diff) / (dollar_volume + 1e-10)  # 避免除零
-    liq = np.nan_to_num(liq, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+    # 确保索引对齐（避免索引不匹配问题）
+    common_dates_pnl = pos_shifted.index.intersection(daily_returns.index)
+    pos_shifted = pos_shifted.loc[common_dates_pnl]
+    daily_returns_aligned = daily_returns.loc[common_dates_pnl]
     
-    # 流动性指标（90分位数）
-    liq_1 = np.nanpercentile(liq, 90, axis=1) * 10
+    # 向量化计算每日个股盈亏（矩阵乘法）
+    pnl_matrix = pos_shifted * daily_returns_aligned
     
-    # 计算持仓（用于计算收益）- 使用实际持仓
-    position = rolling_sum_nb(actual_positions, window, minp=1)
-    position_long = rolling_sum_nb(long_alpha, window, minp=1)
+    # 汇总得到每日总盈亏（向量化求和）
+    daily_pnl = pnl_matrix.sum(axis=1).values
     
-    # 计算每日盈亏（使用实际持仓）
-    pnl_long = returns * long_alpha
-    pnl_short = returns * short_alpha
+    # ========== 7. 计算换手率与交易成本 ==========
+    # 换手 = abs(今天目标持仓 - 昨天目标持仓)
+    # 使用向量化操作计算仓位变化
+    pos_diff = pos_df.diff()
+    # 第一天视为从0建仓，所以第一天的换手 = 第一天的持仓
+    pos_diff.iloc[0] = pos_df.iloc[0]
     
-    # 计算每日总盈亏
-    daily_pnl = np.nansum(pnl_long + pnl_short, axis=1)
+    # 每日总换手金额（向量化求和）
+    daily_turnover = pos_diff.abs().sum(axis=1).values
     
-    # 计算每日收益
-    # window = hold_period，确保收益计算与实际持仓期一致
-    daily_ret = daily_pnl / (booksize * window)
+    # 计算交易成本（买卖双边）
+    cost_rate = costs.get('total_cost', 0.0015)  # 默认万分之15（含滑点）
+    daily_cost = daily_turnover * cost_rate
     
-    # 计算交易成本
-    total_cost = costs.get('total_cost', 0.0015)
-    cost_pnl = -tvr * booksize * window * total_cost
+    # ========== 8. 计算每日收益率 ==========
+    # 费前收益率 = 每日盈亏 / 组合规模
+    daily_ret = daily_pnl / booksize
     
-    # 扣除成本后的收益
-    daily_ret_net = daily_ret + (cost_pnl / (booksize * window))
+    # 费后收益率 = (每日盈亏 - 交易成本) / 组合规模
+    daily_ret_net = (daily_pnl - daily_cost) / booksize
     
-    # 构建结果 DataFrame
+    # ========== 9. 计算每日多头总仓位（用于验证）==========
+    long_size = pos_df.sum(axis=1).values
+    
+    # ========== 10. 构建结果 DataFrame ==========
+    # 注意：daily_pnl 的索引是 common_dates_pnl（对齐后的日期）
+    # 需要确保所有结果的索引一致
+    results_index = common_dates_pnl
+    
     results = pd.DataFrame({
-        'ret': daily_ret,
-        'ret_net': daily_ret_net,
-        'tvr': tvr,
-        'dailypnl': daily_pnl,
-        'dailypnl_net': daily_pnl + cost_pnl,
-        'long_size': long_size,
-        'short_size': short_size,
-        'liq': liq_1
-    }, index=common_dates)
+        'ret': daily_ret,              # 每日收益率（费前）
+        'ret_net': daily_ret_net,      # 每日收益率（费后）
+        'tvr': daily_turnover / booksize,  # 每日换手率
+        'dailypnl': daily_pnl,         # 每日盈亏（绝对金额）
+        'dailypnl_net': daily_pnl - daily_cost,  # 每日盈亏（扣除成本后）
+        'long_size': long_size         # 每日多头总仓位
+    }, index=results_index)
     
     return results
 
 
 def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
     """
-    计算性能指标
+    计算性能指标（基于每日收益率）
     
     Parameters:
     -----------
     returns : pd.Series
-        每日收益序列
+        每日收益率序列（已经是单日收益率）
     risk_free_rate : float
         无风险利率（年化）
     
     Returns:
     --------
     dict
-        性能指标字典
+        性能指标字典，包含：
+        - annual_return: 年化收益率
+        - annual_volatility: 年化波动率
+        - sharpe_ratio: 夏普比率
+        - cumulative_return: 累计收益率
+        - max_drawdown: 最大回撤
+        - max_drawdown_duration: 最大回撤持续时间（天数）
+        - win_rate: 胜率
+        - profit_loss_ratio: 盈亏比
+        - total_trades: 总交易天数
+        - positive_trades: 盈利天数
+        - negative_trades: 亏损天数
     """
-    # 年化收益
+    # 年化收益（基于252个交易日）
     annual_ret = returns.mean() * 252
     
-    # 年化波动率
+    # 年化波动率（基于252个交易日）
     annual_vol = returns.std() * np.sqrt(252)
     
     # 夏普比率
@@ -263,27 +275,6 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
     }
 
 
-@njit
-def _calculate_mddd(ret: np.ndarray) -> int:
-    """计算最大回撤持续时间"""
-    returns = np.cumsum(ret) + 1
-    mddd = 0
-    max_value = 1.0
-    max_idx = 0
-    
-    for i in range(returns.shape[0]):
-        value = returns[i]
-        if value > max_value:
-            max_value = value
-            max_idx = i
-        else:
-            tmp_ddd = i - max_idx
-            if tmp_ddd > mddd:
-                mddd = tmp_ddd
-    
-    return mddd
-
-
 def load_backtest_config(config_path: Optional[Path] = None) -> Dict:
     """加载回测配置"""
     if config_path is None:
@@ -304,4 +295,3 @@ def load_costs_config(config_path: Optional[Path] = None) -> Dict:
         config = yaml.safe_load(f)
     
     return config.get('costs', {})
-

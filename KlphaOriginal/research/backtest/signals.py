@@ -16,8 +16,9 @@ def cs_booksize_nb(
     lower_bound: float = 0.0
 ) -> np.ndarray:
     """
-    横截面仓位标准化（参考加密货币回测代码）
-    确保每个时间点的总仓位大小固定，并控制单只股票上限
+    横截面仓位标准化（只做多策略）
+    确保每个时间点的总仓位大小固定为1.0，并控制单只股票上限
+    所有负值仓位将被设为0（只做多）
     
     Parameters:
     -----------
@@ -33,49 +34,63 @@ def cs_booksize_nb(
     Returns:
     --------
     np.ndarray
-        标准化后的仓位数组
+        标准化后的仓位数组（只包含非负值，总和为size）
     """
     result = data.copy()
     
     for i in prange(data.shape[0]):
         tmp = result[i, :].copy()
         
-        # 分离多空仓位
-        positive_sum = np.nansum(tmp[tmp > 0])
-        negative_sum = np.nansum(np.abs(tmp[tmp < 0]))
-        
-        # 标准化多仓
-        if positive_sum > 0:
-            tmp[tmp > 0] = tmp[tmp > 0] * (size / positive_sum)
-        
-        # 标准化空仓
-        if negative_sum > 0:
-            tmp[tmp < 0] = tmp[tmp < 0] * (size / negative_sum)
+        # 只做多：将所有负值设为0
+        tmp[tmp < 0] = 0.0
         
         # 去除低于阈值的仓位
-        tmp[np.abs(tmp) < lower_bound] = 0.0
+        tmp[tmp < lower_bound] = 0.0
         
-        # 重新标准化（因为去除了小仓位）
-        positive_sum = np.nansum(tmp[tmp > 0])
-        negative_sum = np.nansum(np.abs(tmp[tmp < 0]))
+        # 计算多仓总和
+        positive_sum = np.nansum(tmp)
         
+        # 标准化多仓，使总仓位为size
         if positive_sum > 0:
-            tmp[tmp > 0] = tmp[tmp > 0] * (size / positive_sum)
-        if negative_sum > 0:
-            tmp[tmp < 0] = tmp[tmp < 0] * (size / negative_sum)
+            tmp = tmp * (size / positive_sum)
+        else:
+            # 如果没有正仓位，全部设为0
+            tmp[:] = 0.0
+            result[i, :] = tmp
+            continue
         
-        # 应用上限约束
-        if np.any(tmp > size * upper_bound):
+        # 应用上限约束（单只股票最大仓位）
+        # 迭代方式：先应用上限，然后重新归一化，直到收敛
+        max_iter = 10
+        for _ in range(max_iter):
+            if not np.any(tmp > size * upper_bound):
+                break
+            
+            # 将超过上限的仓位设为上限
             tmp[tmp > size * upper_bound] = size * upper_bound
-            positive_sum = np.nansum(tmp[tmp > 0])
-            if positive_sum > 0:
-                tmp[tmp > 0] = tmp[tmp > 0] / positive_sum * size
-        
-        if np.any(tmp < -size * upper_bound):
-            tmp[tmp < -size * upper_bound] = -size * upper_bound
-            negative_sum = np.nansum(np.abs(tmp[tmp < 0]))
-            if negative_sum > 0:
-                tmp[tmp < 0] = tmp[tmp < 0] / negative_sum * size
+            
+            # 计算已分配的仓位总和
+            allocated = np.nansum(tmp[tmp >= size * upper_bound])
+            remaining = size - allocated
+            
+            # 计算未达到上限的仓位总和
+            below_bound_sum = np.nansum(tmp[tmp < size * upper_bound])
+            
+            if below_bound_sum > 0 and remaining > 0:
+                # 将剩余仓位按比例分配给未达到上限的股票
+                tmp[tmp < size * upper_bound] = tmp[tmp < size * upper_bound] * (remaining / below_bound_sum)
+            elif remaining > 0:
+                # 如果所有股票都达到上限，但还有剩余仓位，说明上限设置不合理
+                # 这种情况下，我们按比例增加所有仓位（虽然会超过上限，但至少保证总和为size）
+                current_sum = np.nansum(tmp)
+                if current_sum > 0:
+                    tmp = tmp * (size / current_sum)
+                break
+            
+            # 最终归一化，确保总和为size（处理浮点误差）
+            current_sum = np.nansum(tmp)
+            if current_sum > 0:
+                tmp = tmp * (size / current_sum)
         
         result[i, :] = tmp
     
@@ -89,23 +104,26 @@ def normalize_positions(
     lower_bound: float = 0.0
 ) -> pd.DataFrame:
     """
-    横截面仓位标准化（DataFrame接口）
+    横截面仓位标准化（DataFrame接口，只做多策略）
+    
+    注意：此函数实现只做多策略，所有负值仓位将被设为0。
+    总仓位固定为 booksize（默认1.0，即100%）。
     
     Parameters:
     -----------
     positions : pd.DataFrame
-        仓位数据，行=日期，列=股票代码
+        仓位数据，行=日期，列=股票代码（负值将被设为0）
     booksize : float
-        目标总仓位大小
+        目标总仓位大小（默认1.0，即100%）
     upper_bound : float
-        单只股票最大仓位
+        单只股票最大仓位（按booksize的比例）
     lower_bound : float
-        单只股票最小仓位阈值
+        单只股票最小仓位阈值（低于此值设为0）
     
     Returns:
     --------
     pd.DataFrame
-        标准化后的仓位
+        标准化后的仓位（只包含非负值，每行总和为booksize）
     """
     values = positions.values.copy()
     normalized = cs_booksize_nb(values, booksize, upper_bound, lower_bound)
