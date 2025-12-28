@@ -166,8 +166,11 @@ def simulate_portfolio(
     # 第一天视为从0建仓，所以第一天的换手 = 第一天的持仓
     pos_diff.iloc[0] = pos_df.iloc[0]
     
+    # 对齐换手率计算的索引（与 PnL 计算保持一致）
+    pos_diff_aligned = pos_diff.loc[common_dates_pnl]
+    
     # 每日总换手金额（向量化求和）
-    daily_turnover = pos_diff.abs().sum(axis=1).values
+    daily_turnover = pos_diff_aligned.abs().sum(axis=1).values
     
     # 计算交易成本（买卖双边）
     cost_rate = costs.get('total_cost', 0.0015)  # 默认万分之15（含滑点）
@@ -181,13 +184,11 @@ def simulate_portfolio(
     daily_ret_net = (daily_pnl - daily_cost) / booksize
     
     # ========== 9. 计算每日多头总仓位（用于验证）==========
-    long_size = pos_df.sum(axis=1).values
+    # 对齐仓位计算的索引
+    long_size = pos_df.loc[common_dates_pnl].sum(axis=1).values
     
     # ========== 10. 构建结果 DataFrame ==========
-    # 注意：daily_pnl 的索引是 common_dates_pnl（对齐后的日期）
-    # 需要确保所有结果的索引一致
-    results_index = common_dates_pnl
-    
+    # 所有结果使用相同的索引（对齐后的日期）
     results = pd.DataFrame({
         'ret': daily_ret,              # 每日收益率（费前）
         'ret_net': daily_ret_net,      # 每日收益率（费后）
@@ -195,7 +196,7 @@ def simulate_portfolio(
         'dailypnl': daily_pnl,         # 每日盈亏（绝对金额）
         'dailypnl_net': daily_pnl - daily_cost,  # 每日盈亏（扣除成本后）
         'long_size': long_size         # 每日多头总仓位
-    }, index=results_index)
+    }, index=common_dates_pnl)
     
     return results
 
