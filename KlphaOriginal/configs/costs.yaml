@@ -1,0 +1,18 @@
+# 交易成本配置
+
+costs:
+  # 佣金率（按交易金额的百分比）
+  commission: 0.001  # 0.1%
+  
+  # 滑点（按交易金额的百分比）
+  slippage: 0.0005  # 0.05%
+  
+  # 总交易成本（commission + slippage）
+  total_cost: 0.0015  # 0.15%
+  
+  # 可选：更详细的成本模型
+  # 固定佣金（美元/笔）
+  fixed_commission: 0.0
+  
+  # 最小佣金（美元）
+  min_commission: 0.0

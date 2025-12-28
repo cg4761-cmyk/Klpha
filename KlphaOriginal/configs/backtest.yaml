@@ -1,0 +1,25 @@
+# 回测配置
+
+backtest:
+  # 组合规模（归一化，1.0 表示100%资金）
+  booksize: 1.0
+  
+  # 单只股票最大仓位（按组合规模的比例）
+  upper_bound: 0.1  # 10%
+  
+  # 单只股票最小仓位阈值（低于此值视为0）
+  lower_bound: 0.0
+  
+  # 持仓天数（买入后持有多少天，然后平仓/调仓）
+  # 收益计算将使用此参数，确保评估的收益与实际持仓期一致
+  hold_period: 14  # 表示x个时间戳后平仓
+  
+  # 回测日期范围（可选，不指定则使用数据全部范围）
+  start_date: null
+  end_date: null
+  
+  # 是否考虑交易成本
+  include_costs: true
+  
+  # 是否计算流动性指标
+  calculate_liquidity: true

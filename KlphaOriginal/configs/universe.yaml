@@ -1,0 +1,26 @@
+# 股票池配置
+
+universe:
+  # 股票池选择
+  # 选项1: 使用 SP500 成分股
+  use_sp500: true
+  
+  # 选项2: 自定义股票池（当 use_sp500 为 false 时使用）
+  custom_symbols:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - TSLA
+    - META
+    - NVDA
+  
+  # 数据日期范围
+  start_date: "2015-01-01"  # 开始日期
+  end_date: null  # 结束日期，null 表示下载到最新，或指定 "2024-12-31"
+  
+  # 筛选条件（可选，暂未实现）
+  filters:
+    min_market_cap: null  # 最小市值（美元）
+    min_price: null        # 最低价格（美元）
+    exclude_sectors: []    # 排除的行业
