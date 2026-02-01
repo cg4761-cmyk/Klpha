@@ -2,7 +2,8 @@
 因子模块
 """
 from .base import BaseFactor
-from .adx import ADXFactor
+from .x_adx import XADXFactor
+from .alpha1 import Alpha1Factor
 
-__all__ = ['BaseFactor', 'ADXFactor']
+__all__ = ['BaseFactor', 'XADXFactor', 'Alpha1Factor']
 

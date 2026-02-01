@@ -53,7 +53,7 @@ def calculate_ic(
         
         if method == 'pearson':
             ic = factor_valid.corr(return_valid)
-        else:  # spearman
+        else: 
             ic = factor_valid.corr(return_valid, method='spearman')
         
         ic_series[date] = ic
@@ -87,7 +87,7 @@ def calculate_ir(ic_series: pd.Series) -> float:
 def factor_returns_by_quantile(
     factor_values: pd.DataFrame,
     forward_returns: pd.DataFrame,
-    n_quantiles: int = 5
+    n_quantiles: int = 10
 ) -> pd.DataFrame:
     """
     按因子值分位数计算各组收益
@@ -99,7 +99,7 @@ def factor_returns_by_quantile(
     forward_returns : pd.DataFrame
         未来收益
     n_quantiles : int
-        分位数数量（如5表示分成5组）
+        分位数数量（如10表示分成10组）
     
     Returns:
     --------
@@ -130,7 +130,21 @@ def factor_returns_by_quantile(
         return_valid = return_row[valid_mask]
         
         # 分位数分组
-        quantiles = pd.qcut(factor_valid, q=n_quantiles, labels=False, duplicates='drop') + 1
+        # 尝试使用 qcut，如果失败（因为唯一值太少），则使用 rank 方法
+        try:
+            quantiles = pd.qcut(factor_valid, q=n_quantiles, labels=False, duplicates='drop') + 1
+            # 检查是否成功分成了足够的组
+            unique_quantiles = quantiles.unique()
+            if len(unique_quantiles) < n_quantiles:
+                # 如果唯一分组数少于预期，使用 rank 方法
+                # 使用 method='first' 确保每个值都有唯一排名
+                quantiles = factor_valid.rank(method='first', ascending=True)
+                # 将排名映射到 1 到 n_quantiles
+                quantiles = pd.cut(quantiles, bins=n_quantiles, labels=False, include_lowest=True) + 1
+        except (ValueError, TypeError):
+            # 如果 qcut 完全失败，使用 rank 方法
+            quantiles = factor_valid.rank(method='first', ascending=True)
+            quantiles = pd.cut(quantiles, bins=n_quantiles, labels=False, include_lowest=True) + 1
         
         # 计算每组平均收益
         for q in range(1, n_quantiles + 1):
@@ -146,7 +160,7 @@ def factor_returns_by_quantile(
 def factor_summary(
     factor_values: pd.DataFrame,
     forward_returns: pd.DataFrame,
-    n_quantiles: int = 5
+    n_quantiles: int = 10
 ) -> Dict:
     """
     因子统计摘要
@@ -204,26 +218,46 @@ def plot_ic_distribution(ic_series: pd.Series, save_path: Optional[str] = None):
     try:
         import matplotlib.pyplot as plt
         
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        # 设置中文显示（如果已设置则使用，否则使用默认）
+        try:
+            plt.rcParams['font.sans-serif']
+        except KeyError:
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        ic_valid = ic_series.dropna()
+        ic_mean = ic_valid.mean()
+        ic_std = ic_valid.std()
+        ir = ic_mean / ic_std if ic_std > 0 else 0.0
         
         # IC 分布直方图
-        axes[0].hist(ic_series.dropna(), bins=50, edgecolor='black', alpha=0.7)
-        axes[0].axvline(ic_series.mean(), color='r', linestyle='--', label=f'Mean: {ic_series.mean():.4f}')
-        axes[0].set_xlabel('IC')
-        axes[0].set_ylabel('Frequency')
-        axes[0].set_title('IC Distribution')
-        axes[0].legend()
+        axes[0].hist(ic_valid, bins=50, edgecolor='black', alpha=0.7, color='steelblue')
+        axes[0].axvline(ic_mean, color='r', linestyle='--', linewidth=2, 
+                       label=f'均值: {ic_mean:.4f}')
+        axes[0].axvline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+        axes[0].set_xlabel('IC 值', fontsize=12)
+        axes[0].set_ylabel('频数', fontsize=12)
+        axes[0].set_title(f'IC 分布\n均值: {ic_mean:.4f}, 标准差: {ic_std:.4f}', 
+                         fontsize=12, fontweight='bold')
+        axes[0].legend(fontsize=10)
         axes[0].grid(True, alpha=0.3)
         
         # IC 时间序列
-        axes[1].plot(ic_series.index, ic_series.values, alpha=0.6)
-        axes[1].axhline(0, color='r', linestyle='--', alpha=0.5)
-        axes[1].axhline(ic_series.mean(), color='g', linestyle='--', 
-                       label=f'Mean: {ic_series.mean():.4f}')
-        axes[1].set_xlabel('Date')
-        axes[1].set_ylabel('IC')
-        axes[1].set_title('IC Time Series')
-        axes[1].legend()
+        axes[1].plot(ic_series.index, ic_series.values, alpha=0.6, linewidth=1, color='steelblue')
+        axes[1].axhline(0, color='gray', linestyle='-', linewidth=1, alpha=0.5)
+        axes[1].axhline(ic_mean, color='r', linestyle='--', linewidth=2,
+                       label=f'均值: {ic_mean:.4f}')
+        axes[1].fill_between(ic_series.index, 
+                            ic_mean - ic_std, 
+                            ic_mean + ic_std, 
+                            alpha=0.2, color='green', label=f'±1 标准差')
+        axes[1].set_xlabel('日期', fontsize=12)
+        axes[1].set_ylabel('IC 值', fontsize=12)
+        axes[1].set_title(f'IC 时间序列\nIR: {ir:.4f}', 
+                         fontsize=12, fontweight='bold')
+        axes[1].legend(fontsize=10)
         axes[1].grid(True, alpha=0.3)
         
         plt.tight_layout()

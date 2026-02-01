@@ -27,8 +27,9 @@ class BacktestDataDownloader:
         self.raw_dir = self.data_dir / "raw" / "daily"
         self.processed_dir = self.data_dir / "processed"
         self.metadata_dir = self.data_dir / "metadata"
+        self.benchmark_dir = self.data_dir / "processed" / "benchmark"
         
-        for dir_path in [self.raw_dir, self.processed_dir, self.metadata_dir]:
+        for dir_path in [self.raw_dir, self.processed_dir, self.metadata_dir, self.benchmark_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
     
     def get_sp500_symbols(self) -> List[str]:
@@ -107,6 +108,79 @@ class BacktestDataDownloader:
             return df
         except Exception as e:
             print(f"下载 {symbol} 失败: {e}")
+            return None
+    
+    def download_sp500_index(self, start_date: str, end_date: str = None, force: bool = False) -> pd.Series:
+        """
+        下载 SP500 指数数据并保存为收益率序列
+        
+        Parameters:
+        -----------
+        start_date : str
+            开始日期 (YYYY-MM-DD)
+        end_date : str, optional
+            结束日期 (YYYY-MM-DD)，如果不指定则下载到最新
+        force : bool
+            是否强制重新下载，即使文件已存在
+        
+        Returns:
+        --------
+        pd.Series
+            SP500 指数的日收益率序列，索引为日期
+        """
+        output_file = self.benchmark_dir / "sp500_returns.pkl"
+        
+        # 检查文件是否已存在且不需要强制下载
+        if not force and output_file.exists():
+            try:
+                existing_returns = pd.read_pickle(output_file)
+                existing_start = existing_returns.index.min()
+                existing_end = existing_returns.index.max()
+                requested_start = pd.Timestamp(start_date)
+                requested_end = pd.Timestamp(end_date) if end_date else pd.Timestamp.now()
+                
+                # 如果现有数据已覆盖所需范围，跳过下载
+                if existing_start <= requested_start and existing_end >= requested_end:
+                    print(f"✓ SP500 基准数据已存在，日期范围: {existing_start.date()} 到 {existing_end.date()}")
+                    print(f"  所需范围: {requested_start.date()} 到 {requested_end.date()}")
+                    print(f"  现有数据已覆盖所需范围，跳过下载")
+                    return existing_returns
+                else:
+                    print(f"⚠ 现有 SP500 数据日期范围: {existing_start.date()} 到 {existing_end.date()}")
+                    print(f"  所需范围: {requested_start.date()} 到 {requested_end.date()}")
+                    print(f"  将更新数据...")
+            except Exception as e:
+                print(f"⚠ 读取现有 SP500 数据失败 ({e})，将重新下载")
+        
+        print("正在下载 SP500 指数数据 (^GSPC)...")
+        
+        try:
+            ticker = yf.Ticker("^GSPC")
+            hist = ticker.history(start=start_date, end=end_date)
+            
+            if hist.empty:
+                print("✗ 无法下载 SP500 数据，请检查网络连接或日期范围")
+                return None
+            
+            # 计算日收益率
+            returns = hist['Close'].pct_change().dropna()
+            returns.name = 'SP500'
+            
+            # 保存为 pickle 文件（方便后续加载）
+            returns.to_pickle(output_file)
+            
+            # 也保存为 CSV（便于查看）
+            csv_file = self.benchmark_dir / "sp500_returns.csv"
+            returns.to_csv(csv_file)
+            
+            print(f"✓ SP500 数据下载完成: {len(returns)} 个交易日")
+            print(f"  日期范围: {returns.index.min()} 到 {returns.index.max()}")
+            print(f"  已保存到: {output_file}")
+            
+            return returns
+            
+        except Exception as e:
+            print(f"✗ 下载 SP500 数据失败: {e}")
             return None
     
     def download_universe(self, symbols: List[str], start_date: str, end_date: str = None):
@@ -293,6 +367,8 @@ def main():
                         help='自定义股票代码列表，如: --symbols AAPL MSFT GOOGL')
     parser.add_argument('--sp500', action='store_true',
                         help='使用 SP500 成分股')
+    parser.add_argument('--download-sp500-index', action='store_true',
+                        help='下载 SP500 指数数据（用于基准对比）')
     
     args = parser.parse_args()
     
@@ -318,6 +394,23 @@ def main():
     start_date = args.start_date or config.get('start_date', '2015-01-01')
     end_date = args.end_date if args.end_date else config.get('end_date')
     
+    # 如果只下载 SP500 指数，直接下载并退出
+    if args.download_sp500_index:
+        print("=" * 60)
+        print("下载 SP500 指数数据")
+        print("=" * 60)
+        print(f"开始日期: {start_date}")
+        print(f"结束日期: {end_date or '最新'}")
+        print("=" * 60)
+        print()
+        
+        downloader.download_sp500_index(start_date, end_date, force=True)
+        
+        print("\n" + "=" * 60)
+        print("✓ SP500 指数数据下载完成！")
+        print("=" * 60)
+        return
+    
     print("=" * 60)
     print("美股回测数据下载器")
     print("=" * 60)
@@ -333,6 +426,12 @@ def main():
     
     # 创建专业量化格式
     data_dict = downloader.create_quant_format(downloaded_symbols)
+    
+    # 自动下载 SP500 基准数据（用于回测对比）
+    print("\n" + "=" * 60)
+    print("下载 SP500 基准数据")
+    print("=" * 60)
+    downloader.download_sp500_index(start_date, end_date)
     
     print("\n" + "=" * 60)
     print("✓ 数据准备完成！可以开始回测了。")

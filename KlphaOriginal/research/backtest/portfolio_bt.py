@@ -8,6 +8,7 @@ from typing import Dict, Optional
 from numba import njit
 from pathlib import Path
 import yaml
+from scipy import stats
 from research.backtest.signals import cs_booksize_nb
 
 
@@ -201,7 +202,44 @@ def simulate_portfolio(
     return results
 
 
-def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
+def create_synthetic_benchmark(prices: pd.DataFrame) -> pd.Series:
+    """
+    创建合成基准（等权重组合），消除幸存者偏差
+    
+    基于当前股票池构建等权重指数，确保基准和策略使用完全相同的股票池。
+    这样可以公平地比较选股能力，而不会受到股票池与真实指数成分股差异的影响。
+    
+    Parameters:
+    -----------
+    prices : pd.DataFrame
+        价格数据，行=日期，列=股票代码
+    
+    Returns:
+    --------
+    pd.Series
+        合成基准的日收益率序列，索引为日期
+        计算方式：每日所有股票收益率的平均值（等权重组合）
+    """
+    # 计算每只股票的单日收益率
+    daily_returns = prices.pct_change()
+    
+    # 计算每日所有股票收益率的平均值（等权重组合）
+    # axis=1 表示按行（日期）计算，即每日所有股票的平均收益率
+    synthetic_benchmark = daily_returns.mean(axis=1)
+    
+    # 删除第一行（NaN，因为 pct_change 的第一行是 NaN）
+    synthetic_benchmark = synthetic_benchmark.dropna()
+    
+    synthetic_benchmark.name = 'Synthetic_Benchmark'
+    
+    return synthetic_benchmark
+
+
+def calculate_metrics(
+    returns: pd.Series, 
+    risk_free_rate: float = 0.0,
+    benchmark_returns: Optional[pd.Series] = None
+) -> Dict:
     """
     计算性能指标（基于每日收益率）
     
@@ -211,14 +249,18 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
         每日收益率序列（已经是单日收益率）
     risk_free_rate : float
         无风险利率（年化）
+    benchmark_returns : pd.Series, optional
+        基准收益率序列（用于计算 Alpha、Beta 等 CAPM 指标）
+        如果提供，将计算 Alpha、Beta、R-Squared 等指标
     
     Returns:
     --------
     dict
         性能指标字典，包含：
-        - annual_return: 年化收益率
+        - annual_return_arithmetic: 算术年化收益率（简单平均）
+        - annual_return_geometric: 几何年化收益率（复利年化）
         - annual_volatility: 年化波动率
-        - sharpe_ratio: 夏普比率
+        - sharpe_ratio: 夏普比率（基于几何年化收益率）
         - cumulative_return: 累计收益率
         - max_drawdown: 最大回撤
         - max_drawdown_duration: 最大回撤持续时间（天数）
@@ -227,15 +269,28 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
         - total_trades: 总交易天数
         - positive_trades: 盈利天数
         - negative_trades: 亏损天数
+        - alpha: Alpha（年化），如果提供了 benchmark_returns
+        - beta: Beta，如果提供了 benchmark_returns
+        - r_squared: R-Squared（拟合优度），如果提供了 benchmark_returns
     """
-    # 年化收益（基于252个交易日）
-    annual_ret = returns.mean() * 252
+    # 算术年化收益（基于252个交易日，简单平均）
+    annual_ret_arithmetic = returns.mean() * 252
+    
+    # 几何年化收益（复利年化，更准确反映实际收益）
+    # 使用对数形式避免数值溢出
+    n_days = len(returns)
+    if n_days > 0:
+        # 方法1：对数形式（更稳定）
+        log_returns = np.log(1 + returns)
+        annual_ret_geometric = np.exp(log_returns.sum() * 252 / n_days) - 1
+    else:
+        annual_ret_geometric = 0.0
     
     # 年化波动率（基于252个交易日）
     annual_vol = returns.std() * np.sqrt(252)
     
-    # 夏普比率
-    sharpe = (annual_ret - risk_free_rate) / annual_vol if annual_vol > 0 else 0
+    # 夏普比率（基于几何年化收益率，更准确）
+    sharpe = (annual_ret_geometric - risk_free_rate) / annual_vol if annual_vol > 0 else 0
     
     # 累计收益
     cumulative_ret = (1 + returns).prod() - 1
@@ -261,8 +316,53 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
         else 0
     )
     
+    # ========== CAPM 指标计算（Alpha & Beta）==========
+    if benchmark_returns is not None:
+        # 1. 基于索引对齐（取交集）
+        common_index = returns.index.intersection(benchmark_returns.index)
+        if len(common_index) == 0:
+            # 如果没有共同索引，返回 NaN
+            alpha = np.nan
+            beta = np.nan
+            r_squared = np.nan
+        else:
+            returns_aligned = returns.loc[common_index]
+            benchmark_aligned = benchmark_returns.loc[common_index]
+            
+            # 2. 扣除无风险利率（将年化无风险利率转换为日度）
+            # 公式：daily_rf = (1 + annual_rf)^(1/252) - 1
+            daily_rf = (1 + risk_free_rate) ** (1 / 252) - 1
+            
+            # 计算超额收益
+            excess_returns = returns_aligned - daily_rf
+            excess_benchmark = benchmark_aligned - daily_rf
+            
+            # 3. 使用线性回归计算 Beta 和 Alpha
+            # 模型：excess_returns = alpha + beta * excess_benchmark + epsilon
+            # scipy.stats.linregress 返回：slope, intercept, rvalue, pvalue, stderr
+            slope, intercept, r_value, p_value, std_err = stats.linregress(
+                excess_benchmark.values,
+                excess_returns.values
+            )
+            
+            # Beta = 斜率
+            beta = slope
+            
+            # Alpha = 截距（日度），需要年化
+            daily_alpha = intercept
+            alpha = daily_alpha * 252
+            
+            # R-Squared = r_value^2
+            r_squared = r_value ** 2
+    else:
+        # 如果未提供基准收益率，返回 NaN
+        alpha = np.nan
+        beta = np.nan
+        r_squared = np.nan
+    
     return {
-        'annual_return': annual_ret,
+        'annual_return_arithmetic': annual_ret_arithmetic,
+        'annual_return_geometric': annual_ret_geometric,
         'annual_volatility': annual_vol,
         'sharpe_ratio': sharpe,
         'cumulative_return': cumulative_ret,
@@ -272,7 +372,10 @@ def calculate_metrics(returns: pd.Series, risk_free_rate: float = 0.0) -> Dict:
         'profit_loss_ratio': profit_loss_ratio,
         'total_trades': len(returns),
         'positive_trades': (returns > 0).sum(),
-        'negative_trades': (returns < 0).sum()
+        'negative_trades': (returns < 0).sum(),
+        'alpha': alpha,
+        'beta': beta,
+        'r_squared': r_squared
     }
 
 
